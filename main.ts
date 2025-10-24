@@ -46,6 +46,17 @@ interface HealthEntry {
 	rawContent: string;
 }
 
+interface CachedEntry {
+	fileName: string;
+	mtime: number; // File modification time
+	parsed: ParsedHealthData;
+}
+
+interface CacheData {
+	version: string; // Cache format version
+	entries: Record<string, CachedEntry>; // Keyed by file path
+}
+
 interface TemporalAssociation {
 	trigger: {
 		type: 'food' | 'supplement' | 'exercise';
@@ -64,9 +75,11 @@ interface TemporalAssociation {
 
 export default class HealthLogAnalyzerPlugin extends Plugin {
 	settings: HealthLogSettings;
+	cache: CacheData;
 
 	async onload() {
 		await this.loadSettings();
+		await this.loadCache();
 
 		// Add ribbon icon
 		this.addRibbonIcon('activity', 'Analyze Health Logs', () => {
@@ -92,6 +105,34 @@ export default class HealthLogAnalyzerPlugin extends Plugin {
 
 	async saveSettings() {
 		await this.saveData(this.settings);
+	}
+
+	async loadCache() {
+		const cacheFile = this.app.vault.adapter.getResourcePath('.obsidian/plugins/health-log-analyzer/cache.json');
+		try {
+			const data = await this.app.vault.adapter.read('.obsidian/plugins/health-log-analyzer/cache.json');
+			this.cache = JSON.parse(data);
+
+			// Validate cache version
+			if (this.cache.version !== '2.0.0') {
+				console.log('Cache version mismatch, resetting cache');
+				this.cache = { version: '2.0.0', entries: {} };
+			}
+		} catch (error) {
+			// Cache doesn't exist or is invalid, initialize empty
+			this.cache = { version: '2.0.0', entries: {} };
+		}
+	}
+
+	async saveCache() {
+		try {
+			await this.app.vault.adapter.write(
+				'.obsidian/plugins/health-log-analyzer/cache.json',
+				JSON.stringify(this.cache, null, 2)
+			);
+		} catch (error) {
+			console.error('Failed to save cache:', error);
+		}
 	}
 
 	async callOllama(prompt: string): Promise<string> {
@@ -227,6 +268,8 @@ Rules:
 	async extractHealthEntries(files: TFile[]): Promise<HealthEntry[]> {
 		const entries: HealthEntry[] = [];
 		let processedCount = 0;
+		let cachedCount = 0;
+		let parsedCount = 0;
 
 		for (const file of files) {
 			const content = await this.app.vault.read(file);
@@ -234,26 +277,50 @@ Rules:
 
 			if (healthLogContent) {
 				processedCount++;
-				new Notice(`Processing ${processedCount}/${files.length}: ${file.basename}...`);
 
 				let parsed: ParsedHealthData;
+				const filePath = file.path;
+				const mtime = file.stat.mtime;
 
-				if (this.settings.useOllama) {
-					try {
-						parsed = await this.parseHealthLogWithLLM(healthLogContent, file.basename);
-					} catch (error) {
-						console.error(`Failed to parse ${file.basename} with LLM:`, error);
-						// Fallback to empty data on error
-						parsed = {
-							foods: [],
-							supplements: [],
-							exercise: [],
-							symptoms: []
-						};
+				// Check cache first
+				const cachedEntry = this.cache.entries[filePath];
+				if (cachedEntry && cachedEntry.mtime === mtime) {
+					// Use cached data
+					parsed = cachedEntry.parsed;
+					cachedCount++;
+
+					if (processedCount % 10 === 0) {
+						new Notice(`Processing ${processedCount}/${files.length} (${cachedCount} cached, ${parsedCount} parsed)...`);
 					}
 				} else {
-					// Fallback: use old parser (we'll keep a simplified version)
-					parsed = this.parseHealthLogLegacy(healthLogContent);
+					// Need to parse
+					parsedCount++;
+					new Notice(`Processing ${processedCount}/${files.length}: ${file.basename} (${cachedCount} cached, ${parsedCount} parsed)...`);
+
+					if (this.settings.useOllama) {
+						try {
+							parsed = await this.parseHealthLogWithLLM(healthLogContent, file.basename);
+						} catch (error) {
+							console.error(`Failed to parse ${file.basename} with LLM:`, error);
+							// Fallback to empty data on error
+							parsed = {
+								foods: [],
+								supplements: [],
+								exercise: [],
+								symptoms: []
+							};
+						}
+					} else {
+						// Fallback: use old parser
+						parsed = this.parseHealthLogLegacy(healthLogContent);
+					}
+
+					// Update cache
+					this.cache.entries[filePath] = {
+						fileName: filePath,
+						mtime: mtime,
+						parsed: parsed
+					};
 				}
 
 				// Only add entry if we found at least something
@@ -268,6 +335,10 @@ Rules:
 				}
 			}
 		}
+
+		// Save cache after processing all files
+		await this.saveCache();
+		new Notice(`Analysis complete! ${cachedCount} from cache, ${parsedCount} newly parsed.`);
 
 		return entries;
 	}
@@ -598,6 +669,27 @@ class HealthLogSettingTab extends PluginSettingTab {
 				<code style="background: var(--background-secondary); padding: 2px 6px; border-radius: 3px;">ollama run ${this.plugin.settings.ollamaModel}</code>
 			`;
 		}
+
+		// Cache management
+		containerEl.createEl('h3', { text: 'Cache Management' });
+
+		new Setting(containerEl)
+			.setName('Clear cache')
+			.setDesc('Clear cached parse results. Use this if you want to force re-parsing all files.')
+			.addButton(button => button
+				.setButtonText('Clear Cache')
+				.onClick(async () => {
+					this.plugin.cache = { version: '2.0.0', entries: {} };
+					await this.plugin.saveCache();
+					new Notice('Cache cleared! Next analysis will re-parse all files.');
+				}));
+
+		const cacheSize = Object.keys(this.plugin.cache.entries).length;
+		const cacheInfo = containerEl.createDiv();
+		cacheInfo.style.fontSize = '0.9em';
+		cacheInfo.style.color = 'var(--text-muted)';
+		cacheInfo.style.marginTop = '5px';
+		cacheInfo.textContent = `Currently cached: ${cacheSize} files`;
 
 		// Add usage instructions
 		containerEl.createEl('h3', { text: 'Usage Instructions' });

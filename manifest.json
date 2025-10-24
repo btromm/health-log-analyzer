@@ -1,7 +1,7 @@
 {
 	"id": "health-log-analyzer",
 	"name": "Health Log Analyzer",
-	"version": "2.0.0",
+	"version": "2.1.0",
 	"minAppVersion": "0.15.0",
 	"description": "Analyzes health logs from daily notes to identify associations between foods, behaviors, and symptoms",
 	"author": "Your Name",
