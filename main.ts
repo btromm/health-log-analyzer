@@ -5,29 +5,61 @@ interface HealthLogSettings {
 	useDateRegex: boolean;
 	dateRegexPattern: string;
 	healthLogHeading: string;
+	// Ollama settings
+	useOllama: boolean;
+	ollamaHost: string;
+	ollamaModel: string;
 }
 
 const DEFAULT_SETTINGS: HealthLogSettings = {
 	dailyNoteTag: '#daily',
 	useDateRegex: true,
 	dateRegexPattern: '\\d{4}-\\d{2}-\\d{2}',
-	healthLogHeading: 'Health log'
+	healthLogHeading: 'Health log',
+	useOllama: true,
+	ollamaHost: 'http://localhost:11434',
+	ollamaModel: 'llama3.2'
+}
+
+interface TimedItem {
+	name?: string;
+	description?: string; // For symptoms
+	activity?: string; // For exercise
+	time?: string;
+	dose?: string;
+	duration?: string;
+	severity?: string;
+	onset?: string; // e.g., "30min later", "2 hours after"
+}
+
+interface ParsedHealthData {
+	foods: TimedItem[];
+	supplements: TimedItem[];
+	exercise: TimedItem[];
+	symptoms: TimedItem[];
 }
 
 interface HealthEntry {
 	date: string;
 	fileName: string;
-	foods: string[];
-	behaviors: string[];
-	symptoms: string[];
+	parsed: ParsedHealthData;
 	rawContent: string;
 }
 
-interface Association {
-	item: string;
-	type: 'food' | 'behavior';
-	symptoms: Map<string, number>;
-	totalOccurrences: number;
+interface TemporalAssociation {
+	trigger: {
+		type: 'food' | 'supplement' | 'exercise';
+		name: string;
+	};
+	symptom: string;
+	occurrences: Array<{
+		date: string;
+		triggerTime?: string;
+		symptomTime?: string;
+		timeLag?: string;
+	}>;
+	totalCount: number;
+	percentage: number;
 }
 
 export default class HealthLogAnalyzerPlugin extends Plugin {
@@ -60,6 +92,81 @@ export default class HealthLogAnalyzerPlugin extends Plugin {
 
 	async saveSettings() {
 		await this.saveData(this.settings);
+	}
+
+	async callOllama(prompt: string): Promise<string> {
+		const url = `${this.settings.ollamaHost}/api/generate`;
+
+		try {
+			const response = await fetch(url, {
+				method: 'POST',
+				headers: {
+					'Content-Type': 'application/json',
+				},
+				body: JSON.stringify({
+					model: this.settings.ollamaModel,
+					prompt: prompt,
+					stream: false,
+					format: 'json'
+				})
+			});
+
+			if (!response.ok) {
+				throw new Error(`Ollama API error: ${response.statusText}`);
+			}
+
+			const data = await response.json();
+			return data.response;
+		} catch (error) {
+			console.error('Ollama API call failed:', error);
+			throw error;
+		}
+	}
+
+	async parseHealthLogWithLLM(content: string, date: string): Promise<ParsedHealthData> {
+		const prompt = `You are analyzing a health log entry. Extract all foods, supplements, exercise, and symptoms with their timing information.
+
+Date: ${date}
+Health Log Content:
+${content}
+
+Extract the following information and return ONLY a valid JSON object with this exact structure:
+{
+  "foods": [{"name": "food name", "time": "time if mentioned"}],
+  "supplements": [{"name": "supplement name", "dose": "dosage if mentioned", "time": "time if mentioned"}],
+  "exercise": [{"activity": "exercise description", "duration": "duration if mentioned", "time": "time if mentioned"}],
+  "symptoms": [{"description": "symptom description", "severity": "severity if mentioned", "time": "time if mentioned", "onset": "when it occurred relative to something else, e.g., '30min later', '2 hours after'"}]
+}
+
+Rules:
+- Extract the actual substance/food name, not the category heading (e.g., "ascorbic acid" not "Morning (food)")
+- For supplements, extract the substance name and dosage separately (e.g., "225mg ascorbic acid" → name: "ascorbic acid", dose: "225mg")
+- For symptoms, extract the actual symptom phrase (e.g., "feeling slightly fatigued and anxious", "stomach feels quite acidic")
+- Include relative timing like "30min later", "after", "2 hours later" in the onset field
+- If no timing information is present, omit the time/onset fields
+- Return ONLY the JSON object, no additional text or explanation`;
+
+		try {
+			const response = await this.callOllama(prompt);
+			const parsed = JSON.parse(response);
+
+			// Ensure all arrays exist
+			return {
+				foods: parsed.foods || [],
+				supplements: parsed.supplements || [],
+				exercise: parsed.exercise || [],
+				symptoms: parsed.symptoms || []
+			};
+		} catch (error) {
+			console.error('Failed to parse health log with LLM:', error);
+			// Return empty structure on error
+			return {
+				foods: [],
+				supplements: [],
+				exercise: [],
+				symptoms: []
+			};
+		}
 	}
 
 	async analyzeHealthLogs() {
@@ -119,15 +226,45 @@ export default class HealthLogAnalyzerPlugin extends Plugin {
 
 	async extractHealthEntries(files: TFile[]): Promise<HealthEntry[]> {
 		const entries: HealthEntry[] = [];
+		let processedCount = 0;
 
 		for (const file of files) {
 			const content = await this.app.vault.read(file);
 			const healthLogContent = this.extractHealthLogSection(content);
 
 			if (healthLogContent) {
-				const entry = this.parseHealthLogContent(healthLogContent, file);
-				if (entry) {
-					entries.push(entry);
+				processedCount++;
+				new Notice(`Processing ${processedCount}/${files.length}: ${file.basename}...`);
+
+				let parsed: ParsedHealthData;
+
+				if (this.settings.useOllama) {
+					try {
+						parsed = await this.parseHealthLogWithLLM(healthLogContent, file.basename);
+					} catch (error) {
+						console.error(`Failed to parse ${file.basename} with LLM:`, error);
+						// Fallback to empty data on error
+						parsed = {
+							foods: [],
+							supplements: [],
+							exercise: [],
+							symptoms: []
+						};
+					}
+				} else {
+					// Fallback: use old parser (we'll keep a simplified version)
+					parsed = this.parseHealthLogLegacy(healthLogContent);
+				}
+
+				// Only add entry if we found at least something
+				if (parsed.foods.length > 0 || parsed.supplements.length > 0 ||
+				    parsed.exercise.length > 0 || parsed.symptoms.length > 0) {
+					entries.push({
+						date: file.basename,
+						fileName: file.path,
+						parsed: parsed,
+						rawContent: healthLogContent
+					});
 				}
 			}
 		}
@@ -168,294 +305,92 @@ export default class HealthLogAnalyzerPlugin extends Plugin {
 		return healthLogLines.length > 0 ? healthLogLines.join('\n') : null;
 	}
 
-	parseHealthLogContent(content: string, file: TFile): HealthEntry | null {
-		const foods: string[] = [];
-		const behaviors: string[] = [];
-		const symptoms: string[] = [];
-
-		// Parse different formats:
-		// - Narrative format: "Ate X, Y, Z — symptom later"
-		// - Lists (bullet points, numbered)
-		// - Labeled items (Food:, Behavior:, Symptom:)
-		// - Free text (we'll try to categorize)
-
-		const lines = content.split('\n');
-		let currentCategory: 'food' | 'behavior' | 'symptom' | null = null;
-
-		for (let line of lines) {
-			line = line.trim();
-			if (!line) continue;
-
-			// Check for category labels (including italic markers)
-			const categoryMatch = line.match(/^[*_]?(Foods?|Behaviors?|Symptoms?)[*_]?[\s:]*(.*)$/i);
-			if (categoryMatch) {
-				const category = categoryMatch[1].toLowerCase();
-				if (category.startsWith('food')) currentCategory = 'food';
-				else if (category.startsWith('behavior')) currentCategory = 'behavior';
-				else if (category.startsWith('symptom')) currentCategory = 'symptom';
-
-				// If there's content after the colon, process it
-				const remaining = categoryMatch[2].trim();
-				if (remaining && currentCategory) {
-					this.addItem(remaining, currentCategory, foods, behaviors, symptoms);
-				}
-				continue;
-			}
-
-			// Check for list items
-			const listMatch = line.match(/^[-*+]\s+(.+)$/) || line.match(/^\d+\.\s+(.+)$/);
-			if (listMatch) {
-				const item = listMatch[1].trim();
-
-				// First, try to parse as narrative format (e.g., "Ate X, Y — symptom")
-				const narrativeResult = this.parseNarrativeEntry(item);
-				if (narrativeResult) {
-					narrativeResult.foods.forEach(f => {
-						if (!foods.includes(f)) foods.push(f);
-					});
-					narrativeResult.behaviors.forEach(b => {
-						if (!behaviors.includes(b)) behaviors.push(b);
-					});
-					narrativeResult.symptoms.forEach(s => {
-						if (!symptoms.includes(s)) symptoms.push(s);
-					});
-					continue;
-				}
-
-				// Check if item has inline category
-				const inlineCategoryMatch = item.match(/^(food|behavior|symptom)[\s:]+(.+)$/i);
-				if (inlineCategoryMatch) {
-					const cat = inlineCategoryMatch[1].toLowerCase() as 'food' | 'behavior' | 'symptom';
-					this.addItem(inlineCategoryMatch[2].trim(), cat, foods, behaviors, symptoms);
-				} else if (currentCategory) {
-					this.addItem(item, currentCategory, foods, behaviors, symptoms);
-				} else {
-					// Try to infer category from keywords
-					this.categorizeAndAddItem(item, foods, behaviors, symptoms);
-				}
-				continue;
-			}
-
-			// Handle comma-separated lists
-			if (currentCategory && line.includes(',')) {
-				const items = line.split(',').map(s => s.trim()).filter(s => s);
-				items.forEach(item => this.addItem(item, currentCategory!, foods, behaviors, symptoms));
-				continue;
-			}
-
-			// Plain text line - try narrative parsing first
-			const narrativeResult = this.parseNarrativeEntry(line);
-			if (narrativeResult) {
-				narrativeResult.foods.forEach(f => {
-					if (!foods.includes(f)) foods.push(f);
-				});
-				narrativeResult.behaviors.forEach(b => {
-					if (!behaviors.includes(b)) behaviors.push(b);
-				});
-				narrativeResult.symptoms.forEach(s => {
-					if (!symptoms.includes(s)) symptoms.push(s);
-				});
-			} else if (currentCategory) {
-				this.addItem(line, currentCategory, foods, behaviors, symptoms);
-			} else {
-				this.categorizeAndAddItem(line, foods, behaviors, symptoms);
-			}
-		}
-
-		// Only return entry if we found at least something
-		if (foods.length === 0 && behaviors.length === 0 && symptoms.length === 0) {
-			return null;
-		}
-
+	parseHealthLogLegacy(content: string): ParsedHealthData {
+		// Simplified fallback parser - just returns empty data
+		// The LLM should be the primary parser
 		return {
-			date: file.basename,
-			fileName: file.path,
-			foods,
-			behaviors,
-			symptoms,
-			rawContent: content
+			foods: [],
+			supplements: [],
+			exercise: [],
+			symptoms: []
 		};
 	}
 
-	parseNarrativeEntry(text: string): { foods: string[], behaviors: string[], symptoms: string[] } | null {
-		// Parse narrative format like:
-		// "Ate eggs, feta, dried mango, bread, and pistachios — migraine symptoms 30min later"
-		// "Had coffee — headache after"
-		// "Exercised for 30 minutes — felt great"
+	analyzeAssociations(entries: HealthEntry[]): TemporalAssociation[] {
+		const associationMap = new Map<string, Map<string, TemporalAssociation>>();
 
-		const foods: string[] = [];
-		const behaviors: string[] = [];
-		const symptoms: string[] = [];
-
-		// Split on temporal indicators that separate cause from effect
-		const separators = /\s*[—–-]{1,3}\s*|\s+(?:then|after(?:ward)?|later|followed by|resulting in|caused|led to)\s+/i;
-		const parts = text.split(separators);
-
-		if (parts.length === 0) return null;
-
-		// First part: usually contains foods/behaviors
-		const firstPart = parts[0].trim();
-
-		// Check for food consumption verbs
-		const foodVerbMatch = firstPart.match(/^(?:ate|had|consumed|drank|eating|drinking|ingested)\s+(.+)/i);
-		if (foodVerbMatch) {
-			// Extract food items from the list
-			const foodList = foodVerbMatch[1];
-			const extractedFoods = this.extractItemList(foodList);
-			foods.push(...extractedFoods);
-		}
-
-		// Check for behavior/activity verbs
-		const behaviorVerbMatch = firstPart.match(/^(?:exercised|worked out|slept|ran|walked|meditated|yoga|stressed|climbed|hiit|lifted|cycled|swam)\s*(?:for)?\s*(.+)/i);
-		if (behaviorVerbMatch) {
-			behaviors.push(this.cleanItem(firstPart));
-		}
-
-		// If we have multiple parts, the later parts likely contain symptoms/effects
-		if (parts.length > 1) {
-			for (let i = 1; i < parts.length; i++) {
-				const part = parts[i].trim();
-				if (!part) continue;
-
-				// Check if this part contains symptom keywords
-				const symptomKeywords = /\b(pain|ache|nausea|tired|fatigue|bloat|bloating|cramp|rash|itch|headache|migraine|dizzy|dizziness|swelling|sore|throat|reflux|discomfort|malaise|joint|stomach|acid|sick|ill)\b/i;
-
-				if (symptomKeywords.test(part)) {
-					// This is likely a symptom description
-					symptoms.push(this.cleanItem(part));
-				}
-			}
-		}
-
-		// Only return if we found foods/behaviors AND symptoms (the point of narrative format)
-		// or if we found clear food consumption patterns
-		if ((foods.length > 0 || behaviors.length > 0) && (symptoms.length > 0 || foodVerbMatch)) {
-			return { foods, behaviors, symptoms };
-		}
-
-		return null;
-	}
-
-	extractItemList(text: string): string[] {
-		// Extract comma-separated items, handling "and" before last item
-		// "eggs, feta, dried mango, bread, and pistachios"
-
-		// Replace "and" with comma for easier splitting
-		text = text.replace(/\s+and\s+/gi, ', ');
-
-		// Split by comma and clean
-		const items = text.split(',')
-			.map(item => this.cleanItem(item))
-			.filter(item => item.length > 0);
-
-		return items;
-	}
-
-	addItem(item: string, category: 'food' | 'behavior' | 'symptom', foods: string[], behaviors: string[], symptoms: string[]) {
-		item = this.cleanItem(item);
-		if (!item) return;
-
-		switch (category) {
-			case 'food':
-				if (!foods.includes(item)) foods.push(item);
-				break;
-			case 'behavior':
-				if (!behaviors.includes(item)) behaviors.push(item);
-				break;
-			case 'symptom':
-				if (!symptoms.includes(item)) symptoms.push(item);
-				break;
-		}
-	}
-
-	categorizeAndAddItem(item: string, foods: string[], behaviors: string[], symptoms: string[]) {
-		item = this.cleanItem(item);
-		if (!item) return;
-
-		const lowerItem = item.toLowerCase();
-
-		// Common symptom keywords - expanded to catch more symptoms
-		const symptomPattern = /\b(pain|ache|nausea|tired|fatigue|bloat|bloating|cramp|rash|itch|itching|headache|migraine|dizzy|dizziness|swelling|sore|throat|reflux|discomfort|malaise|joint|stomach|acid|sick|ill|nasty|hurt|suffer)/i;
-
-		if (symptomPattern.test(lowerItem)) {
-			if (!symptoms.includes(item)) symptoms.push(item);
-		}
-		// Common behavior keywords
-		else if (lowerItem.match(/\b(exercise|exercised|walk|walked|run|ran|sleep|slept|stress|stressed|anxiety|workout|meditation|meditated|yoga|climb|climbed|lift|lifted|hiit|cycle|cycled|swim|swam)\b/i)) {
-			if (!behaviors.includes(item)) behaviors.push(item);
-		}
-		// Default to food if unclear
-		else {
-			if (!foods.includes(item)) foods.push(item);
-		}
-	}
-
-	cleanItem(item: string): string {
-		// Remove markdown formatting and extra whitespace
-		return item
-			.replace(/\*\*/g, '')
-			.replace(/\*/g, '')
-			.replace(/^[-*+]\s+/, '')
-			.replace(/^\d+\.\s+/, '')
-			.trim();
-	}
-
-	analyzeAssociations(entries: HealthEntry[]): Association[] {
-		const associationMap = new Map<string, Association>();
-
-		// For each entry, link foods/behaviors to symptoms that occurred
+		// For each entry, link triggers (foods/supplements/exercise) to symptoms
 		for (const entry of entries) {
-			// Process foods
-			for (const food of entry.foods) {
-				if (!associationMap.has(food)) {
-					associationMap.set(food, {
-						item: food,
-						type: 'food',
-						symptoms: new Map(),
-						totalOccurrences: 0
-					});
+			const triggers = [
+				...entry.parsed.foods.map(f => ({ type: 'food' as const, item: f })),
+				...entry.parsed.supplements.map(s => ({ type: 'supplement' as const, item: s })),
+				...entry.parsed.exercise.map(e => ({ type: 'exercise' as const, item: e }))
+			];
+
+			for (const trigger of triggers) {
+				// Extract name from different fields depending on trigger type
+				const triggerName = trigger.item.name || trigger.item.activity || trigger.item.description || 'unknown';
+				const triggerKey = `${trigger.type}:${triggerName}`;
+
+				if (!associationMap.has(triggerKey)) {
+					associationMap.set(triggerKey, new Map());
 				}
-				const assoc = associationMap.get(food)!;
-				assoc.totalOccurrences++;
+
+				const symptomMap = associationMap.get(triggerKey)!;
 
 				// Link to symptoms in same entry
-				for (const symptom of entry.symptoms) {
-					const count = assoc.symptoms.get(symptom) || 0;
-					assoc.symptoms.set(symptom, count + 1);
-				}
-			}
+				for (const symptom of entry.parsed.symptoms) {
+					const symptomKey = symptom.description || symptom.name || 'unknown';
 
-			// Process behaviors
-			for (const behavior of entry.behaviors) {
-				if (!associationMap.has(behavior)) {
-					associationMap.set(behavior, {
-						item: behavior,
-						type: 'behavior',
-						symptoms: new Map(),
-						totalOccurrences: 0
+					if (!symptomMap.has(symptomKey)) {
+						symptomMap.set(symptomKey, {
+							trigger: {
+								type: trigger.type,
+								name: triggerName
+							},
+							symptom: symptomKey,
+							occurrences: [],
+							totalCount: 0,
+							percentage: 0
+						});
+					}
+
+					const assoc = symptomMap.get(symptomKey)!;
+					assoc.occurrences.push({
+						date: entry.date,
+						triggerTime: trigger.item.time,
+						symptomTime: symptom.time,
+						timeLag: symptom.onset
 					});
-				}
-				const assoc = associationMap.get(behavior)!;
-				assoc.totalOccurrences++;
-
-				// Link to symptoms in same entry
-				for (const symptom of entry.symptoms) {
-					const count = assoc.symptoms.get(symptom) || 0;
-					assoc.symptoms.set(symptom, count + 1);
+					assoc.totalCount++;
 				}
 			}
 		}
 
-		return Array.from(associationMap.values())
-			.sort((a, b) => b.totalOccurrences - a.totalOccurrences);
+		// Flatten the nested maps and calculate percentages
+		const associations: TemporalAssociation[] = [];
+		for (const [triggerKey, symptomMap] of associationMap) {
+			// Count total occurrences of this trigger across all entries
+			const totalTriggerOccurrences = Array.from(symptomMap.values())
+				.reduce((sum, assoc) => Math.max(sum, assoc.totalCount), 0);
+
+			for (const assoc of symptomMap.values()) {
+				// Calculate percentage: how often did this symptom occur when trigger was present?
+				assoc.percentage = (assoc.totalCount / totalTriggerOccurrences) * 100;
+				associations.push(assoc);
+			}
+		}
+
+		// Sort by total count (most common associations first)
+		return associations.sort((a, b) => b.totalCount - a.totalCount);
 	}
 }
 
 class HealthLogResultsModal extends Modal {
 	entries: HealthEntry[];
-	associations: Association[];
+	associations: TemporalAssociation[];
 
-	constructor(app: App, entries: HealthEntry[], associations: Association[]) {
+	constructor(app: App, entries: HealthEntry[], associations: TemporalAssociation[]) {
 		super(app);
 		this.entries = entries;
 		this.associations = associations;
@@ -471,55 +406,70 @@ class HealthLogResultsModal extends Modal {
 		const statsDiv = contentEl.createDiv({ cls: 'health-log-stats' });
 		statsDiv.createEl('p', { text: `Total entries analyzed: ${this.entries.length}` });
 
-		const totalFoods = new Set(this.entries.flatMap(e => e.foods)).size;
-		const totalBehaviors = new Set(this.entries.flatMap(e => e.behaviors)).size;
-		const totalSymptoms = new Set(this.entries.flatMap(e => e.symptoms)).size;
+		const totalFoods = new Set(this.entries.flatMap(e => e.parsed.foods.map(f => f.name))).size;
+		const totalSupplements = new Set(this.entries.flatMap(e => e.parsed.supplements.map(s => s.name))).size;
+		const totalExercise = new Set(this.entries.flatMap(e => e.parsed.exercise.map(ex => ex.name || ex.activity || 'exercise'))).size;
+		const totalSymptoms = new Set(this.entries.flatMap(e => e.parsed.symptoms.map(s => s.description || s.name || 'unknown'))).size;
 
 		statsDiv.createEl('p', { text: `Unique foods: ${totalFoods}` });
-		statsDiv.createEl('p', { text: `Unique behaviors: ${totalBehaviors}` });
+		statsDiv.createEl('p', { text: `Unique supplements: ${totalSupplements}` });
+		statsDiv.createEl('p', { text: `Unique exercise: ${totalExercise}` });
 		statsDiv.createEl('p', { text: `Unique symptoms: ${totalSymptoms}` });
 
 		// Associations
-		contentEl.createEl('h3', { text: 'Associations Found' });
+		contentEl.createEl('h3', { text: 'Temporal Associations Found' });
 
 		if (this.associations.length === 0) {
-			contentEl.createEl('p', { text: 'No associations found. Make sure your health logs contain symptoms.' });
+			contentEl.createEl('p', { text: 'No associations found. Make sure your health logs contain both triggers and symptoms.' });
 			return;
 		}
 
 		for (const assoc of this.associations) {
-			if (assoc.symptoms.size === 0) continue;
-
 			const assocDiv = contentEl.createDiv({ cls: 'health-association' });
 
 			const title = assocDiv.createEl('h4', {
-				text: `${assoc.item} (${assoc.type})`
+				text: `${assoc.trigger.name} (${assoc.trigger.type})`
 			});
 			title.style.marginBottom = '8px';
 
-			const occurrences = assocDiv.createEl('p', {
-				text: `Logged ${assoc.totalOccurrences} times`
+			const subtitle = assocDiv.createEl('p', {
+				text: `→ ${assoc.symptom}`
 			});
-			occurrences.style.fontSize = '0.9em';
-			occurrences.style.color = 'var(--text-muted)';
+			subtitle.style.fontSize = '1em';
+			subtitle.style.fontWeight = 'bold';
+			subtitle.style.color = 'var(--text-accent)';
+			subtitle.style.marginBottom = '8px';
 
-			if (assoc.symptoms.size > 0) {
-				const symptomsList = assocDiv.createEl('ul');
-				symptomsList.style.marginLeft = '20px';
+			const stats = assocDiv.createEl('p', {
+				text: `Occurred ${assoc.totalCount} times (${assoc.percentage.toFixed(1)}% correlation)`
+			});
+			stats.style.fontSize = '0.9em';
+			stats.style.color = 'var(--text-muted)';
 
-				const sortedSymptoms = Array.from(assoc.symptoms.entries())
-					.sort((a, b) => b[1] - a[1]);
+			// Show temporal details if available
+			const timeLags = assoc.occurrences
+				.map(occ => occ.timeLag)
+				.filter(lag => lag && lag.length > 0);
 
-				for (const [symptom, count] of sortedSymptoms) {
-					const percentage = ((count / assoc.totalOccurrences) * 100).toFixed(1);
-					symptomsList.createEl('li', {
-						text: `${symptom}: ${count}/${assoc.totalOccurrences} times (${percentage}%)`
-					});
-				}
+			if (timeLags.length > 0) {
+				const lagText = assocDiv.createEl('p', {
+					text: `Timing: ${timeLags.slice(0, 3).join(', ')}${timeLags.length > 3 ? '...' : ''}`
+				});
+				lagText.style.fontSize = '0.85em';
+				lagText.style.color = 'var(--text-muted)';
+				lagText.style.fontStyle = 'italic';
 			}
 
+			// Show sample dates
+			const sampleDates = assoc.occurrences.slice(0, 3).map(occ => occ.date).join(', ');
+			const datesText = assocDiv.createEl('p', {
+				text: `Sample occurrences: ${sampleDates}${assoc.occurrences.length > 3 ? '...' : ''}`
+			});
+			datesText.style.fontSize = '0.8em';
+			datesText.style.color = 'var(--text-faint)';
+
 			assocDiv.style.marginBottom = '20px';
-			assocDiv.style.padding = '10px';
+			assocDiv.style.padding = '12px';
 			assocDiv.style.border = '1px solid var(--background-modifier-border)';
 			assocDiv.style.borderRadius = '5px';
 		}
@@ -600,6 +550,54 @@ class HealthLogSettingTab extends PluginSettingTab {
 					this.plugin.settings.healthLogHeading = value;
 					await this.plugin.saveSettings();
 				}));
+
+		// Ollama settings
+		containerEl.createEl('h3', { text: 'LLM Parsing Settings' });
+
+		new Setting(containerEl)
+			.setName('Use Ollama for parsing')
+			.setDesc('Enable LLM-based parsing for better extraction of foods, supplements, and symptoms')
+			.addToggle(toggle => toggle
+				.setValue(this.plugin.settings.useOllama)
+				.onChange(async (value) => {
+					this.plugin.settings.useOllama = value;
+					await this.plugin.saveSettings();
+					this.display(); // Refresh to show/hide Ollama settings
+				}));
+
+		if (this.plugin.settings.useOllama) {
+			new Setting(containerEl)
+				.setName('Ollama host')
+				.setDesc('Ollama API endpoint (default: http://localhost:11434)')
+				.addText(text => text
+					.setPlaceholder('http://localhost:11434')
+					.setValue(this.plugin.settings.ollamaHost)
+					.onChange(async (value) => {
+						this.plugin.settings.ollamaHost = value;
+						await this.plugin.saveSettings();
+					}));
+
+			new Setting(containerEl)
+				.setName('Ollama model')
+				.setDesc('Model to use for parsing (e.g., llama3.2, mistral, qwen2.5)')
+				.addText(text => text
+					.setPlaceholder('llama3.2')
+					.setValue(this.plugin.settings.ollamaModel)
+					.onChange(async (value) => {
+						this.plugin.settings.ollamaModel = value;
+						await this.plugin.saveSettings();
+					}));
+
+			const ollamaNote = containerEl.createDiv();
+			ollamaNote.style.fontSize = '0.9em';
+			ollamaNote.style.color = 'var(--text-muted)';
+			ollamaNote.style.marginTop = '10px';
+			ollamaNote.style.marginBottom = '20px';
+			ollamaNote.innerHTML = `
+				<p><strong>Note:</strong> Make sure Ollama is running with the selected model:</p>
+				<code style="background: var(--background-secondary); padding: 2px 6px; border-radius: 3px;">ollama run ${this.plugin.settings.ollamaModel}</code>
+			`;
+		}
 
 		// Add usage instructions
 		containerEl.createEl('h3', { text: 'Usage Instructions' });
