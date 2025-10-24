@@ -1,0 +1,34 @@
+/* Health Log Analyzer Plugin Styles */
+
+.health-log-stats {
+	background-color: var(--background-secondary);
+	padding: 15px;
+	border-radius: 5px;
+	margin-bottom: 20px;
+}
+
+.health-log-stats p {
+	margin: 5px 0;
+}
+
+.health-association {
+	margin-bottom: 20px;
+	padding: 10px;
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 5px;
+	background-color: var(--background-primary);
+}
+
+.health-association h4 {
+	margin-bottom: 8px;
+	color: var(--text-normal);
+}
+
+.health-association ul {
+	margin-left: 20px;
+	margin-top: 10px;
+}
+
+.health-association li {
+	margin: 5px 0;
+}

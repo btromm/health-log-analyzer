@@ -1,0 +1,28 @@
+# Node modules
+node_modules
+
+# Build outputs
+main.js
+main.js.map
+*.js.map
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Obsidian vault (don't commit user's vault)
+Obsidian/
+
+# Migration artifacts
+migration-log.txt
+MIGRATION-SUMMARY.md
+VERIFICATION-REPORT.md
+migrate-health-logs.py
