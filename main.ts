@@ -76,6 +76,7 @@ interface TemporalAssociation {
 export default class HealthLogAnalyzerPlugin extends Plugin {
 	settings: HealthLogSettings;
 	cache: CacheData;
+	cancelAnalysis: boolean = false;
 
 	async onload() {
 		await this.loadSettings();
@@ -271,74 +272,121 @@ Rules:
 		let cachedCount = 0;
 		let parsedCount = 0;
 
-		for (const file of files) {
-			const content = await this.app.vault.read(file);
-			const healthLogContent = this.extractHealthLogSection(content);
+		// Reset cancel flag
+		this.cancelAnalysis = false;
 
-			if (healthLogContent) {
-				processedCount++;
+		// Create persistent notice with cancel button
+		const fragment = document.createDocumentFragment();
+		const noticeEl = document.createElement('div');
+		noticeEl.style.display = 'flex';
+		noticeEl.style.alignItems = 'center';
+		noticeEl.style.gap = '10px';
+		noticeEl.style.width = '100%';
 
-				let parsed: ParsedHealthData;
-				const filePath = file.path;
-				const mtime = file.stat.mtime;
+		const messageEl = document.createElement('span');
+		noticeEl.appendChild(messageEl);
 
-				// Check cache first
-				const cachedEntry = this.cache.entries[filePath];
-				if (cachedEntry && cachedEntry.mtime === mtime) {
-					// Use cached data
-					parsed = cachedEntry.parsed;
-					cachedCount++;
+		const cancelBtn = document.createElement('button');
+		cancelBtn.textContent = 'Cancel';
+		cancelBtn.style.marginLeft = 'auto';
+		cancelBtn.addEventListener('click', () => {
+			this.cancelAnalysis = true;
+			cancelBtn.disabled = true;
+			cancelBtn.textContent = 'Cancelling...';
+		});
+		noticeEl.appendChild(cancelBtn);
 
-					if (processedCount % 10 === 0) {
-						new Notice(`Processing ${processedCount}/${files.length} (${cachedCount} cached, ${parsedCount} parsed)...`);
-					}
-				} else {
-					// Need to parse
-					parsedCount++;
-					new Notice(`Processing ${processedCount}/${files.length}: ${file.basename} (${cachedCount} cached, ${parsedCount} parsed)...`);
+		fragment.appendChild(noticeEl);
 
-					if (this.settings.useOllama) {
-						try {
-							parsed = await this.parseHealthLogWithLLM(healthLogContent, file.basename);
-						} catch (error) {
-							console.error(`Failed to parse ${file.basename} with LLM:`, error);
-							// Fallback to empty data on error
-							parsed = {
-								foods: [],
-								supplements: [],
-								exercise: [],
-								symptoms: []
-							};
-						}
-					} else {
-						// Fallback: use old parser
-						parsed = this.parseHealthLogLegacy(healthLogContent);
-					}
+		const notice = new Notice(fragment, 0); // 0 = persistent
 
-					// Update cache
-					this.cache.entries[filePath] = {
-						fileName: filePath,
-						mtime: mtime,
-						parsed: parsed
-					};
+		const updateNotice = (message: string) => {
+			messageEl.textContent = message;
+		};
+
+		try {
+			for (const file of files) {
+				// Check for cancellation
+				if (this.cancelAnalysis) {
+					updateNotice(`Cancelled after processing ${processedCount}/${files.length} files`);
+					await this.saveCache(); // Save what we've processed so far
+					setTimeout(() => notice.hide(), 3000);
+					return entries;
 				}
 
-				// Only add entry if we found at least something
-				if (parsed.foods.length > 0 || parsed.supplements.length > 0 ||
-				    parsed.exercise.length > 0 || parsed.symptoms.length > 0) {
-					entries.push({
-						date: file.basename,
-						fileName: file.path,
-						parsed: parsed,
-						rawContent: healthLogContent
-					});
+				const content = await this.app.vault.read(file);
+				const healthLogContent = this.extractHealthLogSection(content);
+
+				if (healthLogContent) {
+					processedCount++;
+
+					let parsed: ParsedHealthData;
+					const filePath = file.path;
+					const mtime = file.stat.mtime;
+
+					// Check cache first
+					const cachedEntry = this.cache.entries[filePath];
+					if (cachedEntry && cachedEntry.mtime === mtime) {
+						// Use cached data
+						parsed = cachedEntry.parsed;
+						cachedCount++;
+					} else {
+						// Need to parse
+						parsedCount++;
+
+						// Update notice with current file
+						updateNotice(`Processing ${processedCount}/${files.length}: ${file.basename} (${cachedCount} cached, ${parsedCount} parsed)`);
+
+						if (this.settings.useOllama) {
+							try {
+								parsed = await this.parseHealthLogWithLLM(healthLogContent, file.basename);
+							} catch (error) {
+								console.error(`Failed to parse ${file.basename} with LLM:`, error);
+								// Fallback to empty data on error
+								parsed = {
+									foods: [],
+									supplements: [],
+									exercise: [],
+									symptoms: []
+								};
+							}
+						} else {
+							// Fallback: use old parser
+							parsed = this.parseHealthLogLegacy(healthLogContent);
+						}
+
+						// Update cache
+						this.cache.entries[filePath] = {
+							fileName: filePath,
+							mtime: mtime,
+							parsed: parsed
+						};
+					}
+
+					// Only add entry if we found at least something
+					if (parsed.foods.length > 0 || parsed.supplements.length > 0 ||
+					    parsed.exercise.length > 0 || parsed.symptoms.length > 0) {
+						entries.push({
+							date: file.basename,
+							fileName: file.path,
+							parsed: parsed,
+							rawContent: healthLogContent
+						});
+					}
 				}
 			}
-		}
 
-		// Save cache after processing all files
-		await this.saveCache();
-		new Notice(`Analysis complete! ${cachedCount} from cache, ${parsedCount} newly parsed.`);
+			// Save cache after processing all files
+			await this.saveCache();
+
+			updateNotice(`✓ Analysis complete! ${cachedCount} from cache, ${parsedCount} newly parsed.`);
+			setTimeout(() => notice.hide(), 3000);
+
+		} catch (error) {
+			updateNotice(`❌ Error during analysis: ${error.message}`);
+			setTimeout(() => notice.hide(), 5000);
+			throw error;
+		}
 
 		return entries;
 	}
